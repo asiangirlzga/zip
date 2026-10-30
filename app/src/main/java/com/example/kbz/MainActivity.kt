@@ -5,6 +5,21 @@ import android.content.Intent
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
+import androidx.media3.effect.Presentation
+import androidx.media3.common.Effects
+import androidx.media3.transformer.Composition
+import androidx.media3.transformer.DefaultEncoderFactory
+import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.ExportException
+import androidx.media3.transformer.ExportResult
+import androidx.media3.transformer.ProgressHolder
+import androidx.media3.transformer.Transformer
+import androidx.media3.transformer.VideoEncoderSettings
+import java.io.File
 import android.os.Bundle
 import android.provider.DocumentsContract
 import android.provider.DocumentsContract.Document
@@ -29,6 +44,8 @@ class MainActivity : Activity() {
     private val REQ_SAVE = 3
     private val REQ_KBZ = 4
     private val REQ_OUT_TREE = 5
+    private val REQ_VIDEO = 6
+    private val REQ_VIDEO_SAVE = 7
 
     private val worker = Executors.newSingleThreadExecutor()
 
@@ -37,6 +54,14 @@ class MainActivity : Activity() {
     private lateinit var resultCard: LinearLayout
     private lateinit var radioFast: RadioButton
     private lateinit var radioSmall: RadioButton
+    private lateinit var vidBalanced: RadioButton
+    private lateinit var vidSmall: RadioButton
+    private lateinit var vidTiny: RadioButton
+    private var videoUri: Uri? = null
+    private var videoSize = 0L
+    private var videoName = "video"
+    private var transformer: Transformer? = null
+    private val ui = Handler(Looper.getMainLooper())
     private val buttons = ArrayList<Button>()
 
     private var pending: List<KbzCodec.Entry> = emptyList()
@@ -116,6 +141,28 @@ class MainActivity : Activity() {
         levelCard.addView(group)
         root.addView(levelCard)
 
+        val videoCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = rounded(col(R.color.card))
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(12) }
+        }
+        videoCard.addView(label("Video quality (H.265)", 14f, R.color.subtext, true))
+        val vg = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
+        fun vr(t: String) = RadioButton(this).apply {
+            text = t; setTextColor(col(R.color.text)); id = View.generateViewId()
+        }
+        vidBalanced = vr("Balanced - keep resolution")
+        vidSmall = vr("Small - 720p")
+        vidTiny = vr("Tiny - 480p, lowest bitrate")
+        vg.addView(vidBalanced); vg.addView(vidSmall); vg.addView(vidTiny)
+        vg.check(vidSmall.id)
+        videoCard.addView(vg)
+        root.addView(videoCard)
+        root.addView(actionButton("Compress a video (H.265)", true) { pickVideo() })
+
         root.addView(actionButton("Compress files", true) { pickFiles() })
         root.addView(actionButton("Compress a folder", true) { pickFolder() })
         root.addView(actionButton("Restore a .kbz archive", false) { pickKbz() })
@@ -159,6 +206,13 @@ class MainActivity : Activity() {
         startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQ_FOLDER)
     }
 
+    private fun pickVideo() {
+        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "video/*"
+        }, REQ_VIDEO)
+    }
+
     private fun pickKbz() {
         startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
@@ -197,6 +251,24 @@ class MainActivity : Activity() {
                     askSave("$rootName.kbz")
                 }
                 REQ_SAVE -> data.data?.let { runCompress(it) }
+                REQ_VIDEO -> {
+                    val u = data.data ?: return
+                    videoUri = u
+                    contentResolver.query(u, null, null, null, null)?.use { c ->
+                        if (c.moveToFirst()) {
+                            val n = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                            val sz = c.getColumnIndex(OpenableColumns.SIZE)
+                            if (n >= 0) videoName = c.getString(n)
+                            if (sz >= 0 && !c.isNull(sz)) videoSize = c.getLong(sz)
+                        }
+                    }
+                    startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                        type = "video/mp4"
+                        putExtra(Intent.EXTRA_TITLE, videoName.substringBeforeLast('.') + "_h265.mp4")
+                    }, REQ_VIDEO_SAVE)
+                }
+                REQ_VIDEO_SAVE -> data.data?.let { runVideo(it) }
                 REQ_KBZ -> {
                     kbzUri = data.data
                     startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
@@ -328,6 +400,103 @@ class MainActivity : Activity() {
                 showCompressResult(result)
             }
         }
+    }
+
+    private fun runVideo(dest: Uri) {
+        val src = videoUri ?: return
+        val height = when {
+            vidTiny.isChecked -> 480
+            vidSmall.isChecked -> 720
+            else -> 0
+        }
+        val bitrate = when {
+            vidTiny.isChecked -> 700_000
+            vidSmall.isChecked -> 1_500_000
+            else -> 0
+        }
+        setBusy(true)
+        status.text = "Compressing video..."
+        progress.progress = 0
+        resultCard.visibility = View.GONE
+
+        val tmp = File(cacheDir, "video_out.mp4")
+        if (tmp.exists()) tmp.delete()
+
+        val enc = DefaultEncoderFactory.Builder(this).apply {
+            if (bitrate > 0) {
+                setRequestedVideoEncoderSettings(VideoEncoderSettings.Builder().setBitrate(bitrate).build())
+            }
+        }.build()
+
+        val t = Transformer.Builder(this)
+            .setVideoMimeType(MimeTypes.VIDEO_H265)
+            .setEncoderFactory(enc)
+            .addListener(object : Transformer.Listener {
+                override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                    ui.removeCallbacksAndMessages(null)
+                    worker.execute {
+                        try {
+                            contentResolver.openOutputStream(dest)!!.use { out ->
+                                tmp.inputStream().use { it.copyTo(out, 256 * 1024) }
+                            }
+                            val newSize = tmp.length()
+                            tmp.delete()
+                            runOnUiThread {
+                                progress.progress = 1000
+                                status.text = "Done"
+                                showVideoResult(videoSize, newSize)
+                                setBusy(false)
+                            }
+                        } catch (e: Exception) {
+                            runOnUiThread { status.text = "Error: ${e.message}"; setBusy(false) }
+                        }
+                    }
+                }
+
+                override fun onError(composition: Composition, exportResult: ExportResult, exportException: ExportException) {
+                    ui.removeCallbacksAndMessages(null)
+                    status.text = "Video error: ${exportException.message}"
+                    setBusy(false)
+                }
+            })
+            .build()
+        transformer = t
+
+        val item = MediaItem.fromUri(src)
+        val effects = if (height > 0) Effects(emptyList(), listOf(Presentation.createForHeight(height))) else Effects.EMPTY
+        val edited = EditedMediaItem.Builder(item).setEffects(effects).build()
+        t.start(edited, tmp.absolutePath)
+
+        val holder = ProgressHolder()
+        val poll = object : Runnable {
+            override fun run() {
+                if (t.getProgress(holder) != Transformer.PROGRESS_STATE_NOT_STARTED) {
+                    progress.progress = holder.progress * 10
+                    status.text = "Compressing video... ${holder.progress}%"
+                }
+                ui.postDelayed(this, 500)
+            }
+        }
+        ui.post(poll)
+    }
+
+    private fun showVideoResult(orig: Long, now: Long) {
+        resultCard.removeAllViews()
+        resultCard.addView(label("Video size comparison", 18f, R.color.text, true))
+        resultCard.addView(label("Original  -  ${fmt(orig)}", 14f, R.color.subtext).apply { setPadding(0, dp(10), 0, 0) })
+        resultCard.addView(bar(1f, col(R.color.subtext)))
+        resultCard.addView(label("H.265  -  ${fmt(now)}", 14f, R.color.subtext))
+        resultCard.addView(bar(if (orig > 0) now.toFloat() / orig else 1f, col(R.color.accent)))
+        val saved = if (orig > 0) (1.0 - now.toDouble() / orig) * 100.0 else 0.0
+        resultCard.addView(label(
+            if (saved > 0.05) "%.1f%% smaller".format(saved) else "No savings - try a lower quality level",
+            20f, if (saved > 0.05) R.color.good else R.color.subtext, true
+        ))
+        resultCard.addView(label(
+            "Video is re-encoded (lossy) and plays in any normal video player.",
+            13f, R.color.subtext
+        ).apply { setPadding(0, dp(8), 0, 0) })
+        resultCard.visibility = View.VISIBLE
     }
 
     private fun runRestore(tree: Uri) {
